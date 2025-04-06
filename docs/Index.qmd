@@ -20,22 +20,26 @@ library(nnet)
 library(baguette)
 library(vip)
 library(patchwork)
+library(glue)
+library(powerjoin)
+
 ```
 
 ```{r load-data}
 library(tidyverse)
+library(glue)
 
-download.file('https://gdex.ucar.edu/dataset/camels/file/camels_attributes_v2.0.pdf', 
-              'data/camels_attributes_v2.0.pdf')
+root <- 'https://gdex.ucar.edu/dataset/camels/file'  # 🔧 Define root BEFORE glue
 types <- c("clim", "geol", "soil", "topo", "vege", "hydro")
-# Where the files live online ...
+
 remote_files  <- glue('{root}/camels_{types}.txt')
-# where we want to download the data ...
 local_files   <- glue('data/camels_{types}.txt')
+
 walk2(remote_files, local_files, download.file, quiet = TRUE)
 
 camels <- map(remote_files, read_delim, show_col_types = FALSE) |> 
   power_full_join(by = 'gauge_id')
+
 ```
 
 #question 1: zero_q_freq represents the percentage of days with zero streamflow (0 mm/day) in a given period, providing insight into hydrological extremes and water behavior in the drainage area.
