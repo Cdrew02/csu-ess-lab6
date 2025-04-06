@@ -1,5 +1,5 @@
 ---
-title: "Index"
+title: "index"
 subtitle: "Ecosystem Science and Sustainability 330"
 author:
   - name: Chris Drew
