@@ -1,0 +1,378 @@
+---
+title: "index"
+subtitle: "Ecosystem Science and Sustainability 330"
+author:
+  - name: Chris Drew
+    email: "cdrew02@colostate.edu"
+format:
+  html:
+    self-contained: true
+execute:
+  echo: true
+---
+
+```{r}
+library(tidyverse)
+library(tidymodels)
+library(tidypredict)
+library(nnet)
+library(baguette)
+library(vip)
+library(patchwork)
+library(glue)
+library(powerjoin)
+
+```
+
+```{r load-data}
+library(tidyverse)
+library(glue)
+
+root <- 'https://gdex.ucar.edu/dataset/camels/file'  # 🔧 Define root BEFORE glue
+types <- c("clim", "geol", "soil", "topo", "vege", "hydro")
+
+remote_files  <- glue('{root}/camels_{types}.txt')
+local_files   <- glue('data/camels_{types}.txt')
+
+walk2(remote_files, local_files, download.file, quiet = TRUE)
+
+camels <- map(remote_files, read_delim, show_col_types = FALSE) |> 
+  power_full_join(by = 'gauge_id')
+
+```
+
+
+
+
+
+#question 1: zero_q_freq represents the percentage of days with zero streamflow (0 mm/day) in a given period, providing insight into hydrological extremes and water behavior in the drainage area.
+
+
+
+
+
+```{r}
+ggplot(data = camels, aes(x = gauge_lon, y = gauge_lat)) +
+  borders("state", colour = "gray50") +
+  geom_point(aes(color = q_mean)) +
+  scale_color_gradient(low = "pink", high = "dodgerblue") +
+  ggthemes::theme_map()
+```
+
+```{r}
+library(ggplot2)
+library(viridis)
+library(patchwork)
+
+library(ggplot2)
+library(viridis)
+
+# Map for aridity
+map_aridity <- ggplot(camels, aes(x = gauge_lon, y = gauge_lat)) + 
+  geom_point(aes(color = aridity)) + 
+  scale_color_viridis_c() +
+  theme_minimal() + 
+  labs(title = "Aridity of Sites", 
+       color = "Aridity")
+
+# Map for p_mean (mean rainfall)
+map_p_mean <- ggplot(camels, aes(x = gauge_lon, y = gauge_lat)) + 
+  geom_point(aes(color = p_mean)) + 
+  scale_color_viridis_c() +
+  theme_minimal() + 
+  labs(title = "Mean Rainfall (p_mean) of Sites", 
+       color = "Mean Rainfall")
+
+# Combine maps using patchwork
+library(patchwork)
+combined_maps <- map_aridity + map_p_mean + plot_layout(ncol = 1)
+
+# Display the combined maps
+print(combined_maps)
+
+
+
+
+```
+
+```{r}
+# Load libraries
+library(tidymodels)
+library(baguette)    # For neural network (bag_mlp)
+library(xgboost)     # For XGBoost model
+library(ggplot2)
+library(ggthemes)
+
+# Set seed for reproducibility
+set.seed(123)
+
+# --- Data Preparation ---
+# Log-transform target variable 'q_mean' to create 'logQmean'
+camels <- camels %>% mutate(logQmean = log(q_mean))
+
+# Split data: 80% for training, 20% for testing
+camels_split <- initial_split(camels, prop = 0.8)
+camels_train <- training(camels_split)
+camels_test  <- testing(camels_split)
+
+# 5-fold cross-validation for faster processing
+camels_cv <- vfold_cv(camels_train, v = 5)
+
+# --- Preprocessing Recipe ---
+# Predict logQmean using aridity and p_mean
+# Log-transform predictors and add an interaction term
+rec <- recipe(logQmean ~ aridity + p_mean, data = camels_train) %>%
+  step_log(all_predictors()) %>%               # Log-transform predictors
+  step_interact(terms = ~ aridity:p_mean) %>%   # Add interaction term
+  step_naomit(all_predictors(), all_outcomes()) # Remove rows with missing data
+
+# --- Model Specifications ---
+# 1. Linear Regression (baseline)
+lm_model <- linear_reg() %>% 
+  set_engine("lm") %>% 
+  set_mode("regression")
+
+# 2. Random Forest Model
+rf_model <- rand_forest() %>% 
+  set_engine("ranger", importance = "impurity") %>% 
+  set_mode("regression")
+
+# 3. XGBoost Model
+xgb_model <- boost_tree(
+  trees = 1000,   # Number of trees
+  tree_depth = 6, # Max depth of trees
+  min_n = 10,     # Min observations per node
+  learn_rate = 0.01 # Learning rate
+) %>%
+  set_engine("xgboost") %>%
+  set_mode("regression")
+
+# 4. Neural Network (bag_mlp) Model
+nn_model <- bag_mlp(
+  hidden_units = 100, # Number of hidden units
+  epochs = 50         # Reduced epochs for quicker testing
+) %>% 
+  set_engine("nnet") %>% 
+  set_mode("regression")
+
+# --- Create Workflow Set ---
+# Combine the recipe and all models into a workflow set
+wf_set <- workflow_set(
+  preproc = list(rec),
+  models  = list(
+    lm  = lm_model,
+    rf  = rf_model,
+    xgb = xgb_model,
+    nn  = nn_model
+  )
+)
+
+# --- Fit Models with Resampling ---
+# Use 5-fold CV to fit each model in the workflow
+wf_res <- wf_set %>% 
+  workflow_map("fit_resamples", 
+               resamples = camels_cv, 
+               seed = 123, 
+               verbose = TRUE)
+
+# --- Evaluate Model Performance ---
+# Collect metrics (e.g., RMSE, R-squared, MAE)
+model_metrics <- wf_res %>% collect_metrics()
+print(model_metrics)
+
+# Rank models based on RMSE (lower is better) or R-squared (higher is better)
+ranked_results <- rank_results(wf_res, rank_metric = "rmse", select_best = TRUE)
+print(ranked_results)
+
+# --- Extract the Best Model ---
+# Assume XGBoost is the best based on RMSE (adjust if necessary)
+best_wf <- wf_res %>%
+  extract_workflow("recipe_xgb") %>%  # Replace with the best model id if different
+  fit(data = camels_train)
+
+# --- Make Predictions on Test Data ---
+best_preds <- predict(best_wf, new_data = camels_test) %>% 
+  bind_cols(camels_test)
+
+# Evaluate the best model's performance on the test data
+test_metrics <- metrics(best_preds, truth = logQmean, estimate = .pred)
+print(test_metrics)
+
+# --- Visualize: Observed vs. Predicted ---
+# Plot observed vs predicted values, colored by aridity
+ggplot(best_preds, aes(x = logQmean, y = .pred, color = aridity)) +
+  geom_point() +
+  geom_abline(linetype = "dashed") +
+  scale_color_viridis_c() +
+  theme_minimal() +
+  labs(title = "Best Model Predictions vs. Observed Log Mean Flow",
+       x = "Observed logQmean",
+       y = "Predicted logQmean",
+       color = "Aridity")
+
+
+```
+
+
+
+
+#Question 3: I would probably move forward with the neural-network model because it has the lowest RMSE and highest R-squared among the models indicating the best predicability performance.
+
+
+
+
+
+```{r}
+# Load libraries
+library(tidyverse)
+library(glue)
+library(powerjoin)    # For merging data frames
+library(tidymodels)
+library(baguette)     # For neural network model
+library(xgboost)      # For XGBoost
+library(ggplot2)
+library(ggthemes)
+library(patchwork)
+setwd("C:/Users/Cadre/git/Lab 6/Lab 6")
+
+# Set seed for reproducibility
+set.seed(123)
+
+# --------------------------------------------------
+# 1. Download and Merge CAMELS Data
+# --------------------------------------------------
+# URLs for CAMELS data files
+root <- 'https://gdex.ucar.edu/dataset/camels/file'
+types <- c("clim", "geol", "hydro", "soil", "topo", "vege")
+remote_files <- glue('{root}/camels_{types}.txt')
+local_files  <- glue('data/camels_{types}.txt')
+
+# Download files if they don't exist
+walk2(remote_files, local_files, ~{
+  if(!file.exists(.y)) download.file(.x, destfile = .y, quiet = TRUE)
+})
+
+# Read files into list of data frames
+camels_list <- map(local_files, read_delim, show_col_types = FALSE)
+
+# Merge data frames on 'gauge_id'
+camels <- power_full_join(camels_list, by = 'gauge_id')
+
+# --------------------------------------------------
+# 2. Data Preparation & Splitting
+# --------------------------------------------------
+# Create log-transformed target variable (logQmean)
+camels <- camels %>% mutate(logQmean = log(q_mean))
+
+# Split data into 75% training and 25% testing
+data_split <- initial_split(camels, prop = 0.75)
+train_data <- training(data_split)
+test_data  <- testing(data_split)
+
+# Create 10-fold cross-validation for training
+cv_folds <- vfold_cv(train_data, v = 10)
+
+# --------------------------------------------------
+# 3. Define Recipe (Data Preprocessing)
+# --------------------------------------------------
+# Choose predictors that affect streamflow
+recipe_model <- recipe(logQmean ~ aridity + p_mean + elev_mean, data = train_data) %>%
+  step_log(all_numeric_predictors()) %>%    # Log-transform predictors
+  step_interact(terms = ~ aridity:p_mean) %>%  # Add interaction between aridity and p_mean
+  step_normalize(all_numeric_predictors()) %>% # Normalize predictors
+  step_naomit(all_predictors(), all_outcomes()) # Remove missing values
+
+# --------------------------------------------------
+# 4. Define Models
+# --------------------------------------------------
+# Random Forest Model
+rf_model <- rand_forest() %>% 
+  set_engine("ranger", importance = "impurity") %>% 
+  set_mode("regression")
+
+# XGBoost Model
+xgb_model <- boost_tree(
+  trees = 1000,
+  tree_depth = 6,
+  min_n = 10,
+  learn_rate = 0.01
+) %>% 
+  set_engine("xgboost") %>% 
+  set_mode("regression")
+
+# Neural Network Model
+nn_model <- bag_mlp(
+  hidden_units = 100,
+  epochs = 50  # Reduced epochs for faster processing
+) %>% 
+  set_engine("nnet") %>% 
+  set_mode("regression")
+
+# --------------------------------------------------
+# 5. Build Workflow Set
+# --------------------------------------------------
+# Combine the recipe and models into a workflow set
+wf_set <- workflow_set(
+  preproc = list(recipe_model),
+  models  = list(
+    rf  = rf_model,
+    xgb = xgb_model,
+    nn  = nn_model
+  )
+)
+
+# --------------------------------------------------
+# 6. Fit Models via Resampling
+# --------------------------------------------------
+# Fit each model using 10-fold cross-validation
+wf_res <- wf_set %>% 
+  workflow_map("fit_resamples", 
+               resamples = cv_folds, 
+               seed = 123, 
+               verbose = TRUE)
+
+# --------------------------------------------------
+# 7. Evaluate and Compare Models
+# --------------------------------------------------
+# Collect performance metrics (e.g., RMSE, R-squared)
+model_metrics <- wf_res %>% collect_metrics()
+print(model_metrics)
+
+# Rank models based on RMSE (lower is better)
+ranked_results <- rank_results(wf_res, rank_metric = "rmse", select_best = TRUE)
+print(ranked_results)
+
+# --------------------------------------------------
+# 8. Evaluate Best Model on Test Data
+# --------------------------------------------------
+# Extract best model (based on previous ranking)
+best_wf <- wf_res %>%
+  extract_workflow("recipe_xgb") %>%  # Use the best model id from ranked_results
+  fit(data = train_data)
+
+# Make predictions on the test data
+best_preds <- predict(best_wf, new_data = test_data) %>% 
+  bind_cols(test_data)
+
+# Evaluate performance on test data
+test_metrics <- metrics(best_preds, truth = logQmean, estimate = .pred)
+print(test_metrics)
+
+# Visualize observed vs. predicted values (colored by aridity)
+ggplot(best_preds, aes(x = logQmean, y = .pred, color = aridity)) +
+  geom_point() +
+  geom_abline(linetype = "dashed") +
+  scale_color_viridis_c() +
+  theme_minimal() +
+  labs(title = "Test Data: Observed vs Predicted Log Mean Flow",
+       x = "Observed logQmean",
+       y = "Predicted logQmean",
+       color = "Aridity")
+
+```
+
+
+
+
+#the model performs pretty good, closely matching observed values for wetter regions but it underpredicts streamflow in drier more arid basins, as seen by the scatter below the 1x1 line.
+
