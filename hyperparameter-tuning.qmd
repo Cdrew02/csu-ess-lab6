@@ -1,0 +1,242 @@
+---
+title: "hyperparameter-tuning"
+format: html
+---
+```{r}
+#| message: false
+#| warning: false
+
+# Load Required Packages --------------------------------------------------
+library(tidyverse)
+library(tidymodels)
+library(powerjoin)
+library(skimr)
+library(visdat)
+library(patchwork)
+library(yardstick)
+library(readr)
+library(purrr)
+library(stringr)
+library(doParallel)
+library(ggpubr)
+
+registerDoParallel(cores = parallel::detectCores() - 1)
+
+# Data Import -------------------------------------------------------------
+# 1. Verify working directory
+cat("Current working directory:", getwd(), "\n")
+data_path <- "C:/Users/Cadre/git/Lab 6/data/"
+setwd("C:/Users/Cadre/git/Lab 6")
+
+cat("Current working directory:", getwd(), "\n")
+
+
+# 3. Diagnostic file search
+file_paths <- list.files(
+  path = data_path,
+  pattern = "camels_.*\\.txt$",
+  full.names = TRUE,
+  ignore.case = TRUE
+)
+
+cat("Looking in:", data_path, "\n")
+cat("Found files:", paste(basename(file_paths), collapse = ", "), "\n\n")
+
+if (length(file_paths) == 0) {
+  cat("Directory contents:\n")
+  print(list.files(data_path))
+  stop("No CAMELS files found. Verify files exist in:\n", normalizePath(data_path))
+}
+
+# 4. Read all .txt files with semicolon delimiter
+data_list <- file_paths |>
+  set_names(basename(file_paths)) |>
+  map(~ read_delim(.x, delim = ";", show_col_types = FALSE))
+
+# 5. Validate expected file count
+if (length(data_list) != 6) {
+  cat("Missing files. Expected 6, found", length(data_list), "\n")
+  print(list.files(data_path))
+  stop("CAMELS data incomplete")
+}
+
+# 6. Standardize column names and ensure gauge_id exists
+data_list <- data_list |> 
+  map(~ {
+    colnames(.x) <- tolower(colnames(.x))
+    if (!"gauge_id" %in% colnames(.x)) {
+      variants <- c("gaugeid", "gauge", "id", "gauge.id")
+      found <- variants[variants %in% colnames(.x)]
+      if (length(found) > 0) {
+        cat("Renaming", found[1], "to gauge_id\n")
+        .x <- rename(.x, gauge_id = all_of(found[1]))
+      } else {
+        stop("No gauge_id column found")
+      }
+    }
+    .x
+  })
+
+stopifnot(
+  "gauge_id missing in some files" = 
+    all(map_lgl(data_list, ~ "gauge_id" %in% colnames(.x)))
+)
+
+# 7. Join all CAMELS data
+camels_raw <- reduce(
+  data_list,
+  ~ power_full_join(.x, .y, by = "gauge_id", conflict = coalesce),
+  .init = data_list[[1]]
+)
+
+stopifnot("Merge failed - camels_raw is NULL" = !is.null(camels_raw))
+glimpse(camels_raw)
+
+# Data Cleaning -----------------------------------------------------------
+camels_clean <- camels_raw |> 
+  distinct() |> 
+  na.omit() |> 
+  mutate(across(where(is.character), as_factor)) |> 
+  relocate(gauge_lat, gauge_lon, .after = last_col())
+
+stopifnot("q_mean must exist" = "q_mean" %in% names(camels_clean))
+
+# Data Splitting ----------------------------------------------------------
+set.seed(123)
+split <- initial_split(camels_clean, prop = 0.8)
+train <- training(split)
+test <- testing(split)
+
+# Feature Engineering -----------------------------------------------------
+model_recipe <- recipe(q_mean ~ ., data = train) |> 
+  step_rm(gauge_lat, gauge_lon) |>  # Remove from predictors
+  step_normalize(all_numeric_predictors()) |> 
+  step_dummy(all_nominal_predictors())
+
+# Recipe Validation
+prepped <- prep(model_recipe, training = train)
+baked <- bake(prepped, new_data = train)
+stopifnot("Coordinates should persist" = c("gauge_lat", "gauge_lon") %in% names(train))
+stopifnot("Coordinates removed from predictors" = !any(c("gauge_lat", "gauge_lon") %in% names(baked)))
+
+
+# Model Development -------------------------------------------------------
+
+
+
+
+
+# Define 3 Models
+linear_model <- linear_reg() |> 
+  set_engine("lm") |> 
+  set_mode("regression")
+
+rf_model <- rand_forest(
+  mode = "regression",
+  engine = "ranger",
+  mtry = tune(),
+  trees = tune()
+)
+
+boost_model <- boost_tree(
+  mode = "regression",
+  engine = "xgboost",
+  learn_rate = tune(),
+  tree_depth = tune()
+)
+
+# Workflow Testing
+model_set <- workflow_set(
+  preproc = list(recipe = model_recipe),
+  models = list(
+    linear = linear_model,
+    random_forest = rf_model,
+    boosted = boost_model
+  )
+)
+
+library(doParallel)
+registerDoParallel(cores = parallel::detectCores() - 1)
+
+folds <- vfold_cv(train, v = 3)
+
+results <- model_set |> 
+  workflow_map(
+    resamples = folds,
+    metrics = metric_set(yardstick::rmse, yardstick::rsq, yardstick::mae),
+    verbose = TRUE
+  )
+
+# Model Tuning ------------------------------------------------------------
+tune_wf <- workflow() |> 
+  add_recipe(model_recipe) |> 
+  add_model(rf_model)
+
+tune_params <- extract_parameter_set_dials(tune_wf)
+tune_params <- finalize(tune_params, train)
+tune_grid <- grid_latin_hypercube(tune_params, size = 25)
+
+
+tuned_results <- tune_grid(
+  tune_wf,
+  resamples = folds,
+  grid = tune_grid,
+  metrics = metric_set(yardstick::rmse, yardstick::rsq, yardstick::mae),
+  control = control_grid(save_pred = TRUE)
+)
+
+# Final Model -------------------------------------------------------------
+best_params <- select_best(tuned_results, metric = "mae")
+final_wf <- finalize_workflow(tune_wf, best_params)
+
+final_fit <- last_fit(final_wf, split)
+test_metrics <- collect_metrics(final_fit)
+
+# Prediction Visualization ------------------------------------------------
+pred_plot <- collect_predictions(final_fit) |> 
+  ggplot(aes(q_mean, .pred)) +
+  geom_point(alpha = 0.5) +
+  geom_abline(color = "red") +
+  geom_smooth(method = "lm", color = "blue") +
+  labs(title = "Final Model Predictions",
+       x = "Observed Streamflow (q_mean)",
+       y = "Predicted Streamflow") +
+  theme_pubr()
+
+# Mapping -----------------------------------------------------------------
+full_model <- fit(final_wf, camels_clean)
+full_pred <- augment(full_model, camels_clean) |> 
+  mutate(residual = (q_mean - .pred)^2)
+
+us_map <- map_data("state")
+
+pred_map <- ggplot() +
+  geom_polygon(data = us_map, 
+               aes(long, lat, group = group),
+               fill = "gray90") +
+  geom_point(data = full_pred, 
+             aes(gauge_lon, gauge_lat, color = .pred),
+             size = 2) +
+  scale_color_viridis_c("Prediction") +
+  coord_map() +
+  theme_void()
+
+resid_map <- ggplot() +
+  geom_polygon(data = us_map, 
+               aes(long, lat, group = group),
+               fill = "gray90") +
+  geom_point(data = full_pred, 
+             aes(gauge_lon, gauge_lat, color = residual),
+             size = 2) +
+  scale_color_viridis_c("Residual", option = "magma") +
+  coord_map() +
+  theme_void()
+
+# Combine outputs
+pred_plot
+(pred_map | resid_map)
+
+```
+
+
+
