@@ -81,7 +81,8 @@ stopifnot(
     all(map_lgl(data_list, ~ "gauge_id" %in% colnames(.x)))
 )
 
-# Join CAMELS data
+# Join the CAMELS data
+
 camels_raw <- reduce(
   data_list,
   ~ power_full_join(.x, .y, by = "gauge_id", conflict = coalesce),
@@ -91,7 +92,7 @@ camels_raw <- reduce(
 stopifnot("Merge failed - camels_raw is NULL" = !is.null(camels_raw))
 glimpse(camels_raw)
 
-# Data Cleaning
+# Data Cleaning---
 camels_clean <- camels_raw |> 
   distinct() |> 
   na.omit() |> 
